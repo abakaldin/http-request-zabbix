@@ -1,0 +1,9 @@
+[package]
+name = "http-request-zabbix"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+http-request = "8.91.16"
+http-type = "4.60.0"
+serde_json = "1.0.143"
