@@ -1,8 +1,44 @@
+//! A Rust library for interacting with the Zabbix API.
+//!
+//! This crate provides a convenient and idiomatic way to communicate with a Zabbix server,
+//! handling authentication, version checking, and raw API requests.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use http_request_zabbix::ZabbixInstance;
+//!
+//! let mut zabbix = ZabbixInstance::builder("http://zabbix.example.com/zabbix/api_jsonrpc.php")
+//!     .danger_accept_invalid_certs(true)
+//!     .build()
+//!     .unwrap();
+//!
+//! zabbix.login("Admin".to_string(), "zabbix".to_string()).unwrap();
+//! println!("Zabbix Version: {}", zabbix.get_version().unwrap());
+//! ```
+
 use reqwest::blocking::Client;
 use semver::{Version, VersionReq};
 use serde_json::Value;
+use thiserror::Error;
 use uuid::Uuid;
 
+/// Error type for Zabbix interactions.
+#[derive(Error, Debug)]
+pub enum ZabbixError {
+    #[error("Network error: {0}")]
+    Network(#[from] reqwest::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("Version parse error: {0}")]
+    VersionParse(#[from] semver::Error),
+    #[error("Zabbix API Error: {message} {data}")]
+    ApiError { message: String, data: String },
+    #[error("Unknown error: {0}")]
+    Other(String),
+}
+
+/// Represents an active connection to a Zabbix server.
 pub struct ZabbixInstance {
     id: String,
     url: String,
@@ -14,7 +50,38 @@ pub struct ZabbixInstance {
 }
 
 impl ZabbixInstance {
-    pub fn new(url: String, accept_invalid_cerst: Option<bool>) -> Result<Self, String> {
+    /// Returns a builder to configure and create a `ZabbixInstance`.
+    pub fn builder(url: &str) -> ZabbixInstanceBuilder {
+        ZabbixInstanceBuilder::new(url)
+    }
+}
+
+/// A builder for creating a `ZabbixInstance`.
+pub struct ZabbixInstanceBuilder {
+    url: String,
+    accept_invalid_certs: bool,
+}
+
+impl ZabbixInstanceBuilder {
+    /// Creates a new builder with the given Zabbix URL.
+    pub fn new(url: &str) -> Self {
+        Self {
+            url: url.to_string(),
+            accept_invalid_certs: false,
+        }
+    }
+
+    /// Configures whether the client should verify the server's TLS certificates.
+    ///
+    /// Setting this to `true` is dangerous and should only be used for testing
+    /// or when using self-signed certificates in a trusted environment.
+    pub fn danger_accept_invalid_certs(mut self, accept: bool) -> Self {
+        self.accept_invalid_certs = accept;
+        self
+    }
+
+    /// Builds the `ZabbixInstance` by connecting to the server and verifying the API version.
+    pub fn build(self) -> Result<ZabbixInstance, ZabbixError> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "apiinfo.version",
@@ -23,40 +90,44 @@ impl ZabbixInstance {
         });
 
         let client = Client::builder()
-            .tls_danger_accept_invalid_certs(accept_invalid_cerst.unwrap_or(false))
-            .build()
-            .map_err(|e| e.to_string())?;
+            .danger_accept_invalid_certs(self.accept_invalid_certs)
+            .build()?;
 
-        let v6_4_req = VersionReq::parse(">=6.4").map_err(|e| e.to_string())?;
+        let v6_4_req = VersionReq::parse(">=6.4")?;
 
-        let version_str_raw = Self::zabbix_raw_request(&client, &url, body, None, false)?;
+        let version_str_raw =
+            ZabbixInstance::zabbix_raw_request(&client, &self.url, body, None, false)?;
         let version_str = version_str_raw.trim_matches('"');
 
-        let current_v = Version::parse(version_str).map_err(|e| e.to_string())?;
+        let current_v = Version::parse(version_str)?;
 
         let need_auth_in_body = !(v6_4_req.matches(&current_v));
 
         Ok(ZabbixInstance {
             id: Uuid::new_v4().to_string(),
-            need_auth_in_body: need_auth_in_body,
+            need_auth_in_body,
             token: None,
             request_client: client,
-            url: url,
+            url: self.url,
             version: version_str.to_string(),
             need_logout: false,
         })
     }
+}
 
+impl ZabbixInstance {
+    /// Returns the internally generated UUID for this instance.
     pub fn id(&self) -> &str {
         &self.id
     }
 
+    /// Returns the Zabbix API URL this instance connects to.
     pub fn url(&self) -> &str {
         &self.url
     }
 
-    #[allow(dead_code)]
-    pub fn set_token(&mut self, token: String) -> Result<&mut Self, String> {
+    /// Sets an existing authentication token and verifies it with the server.
+    pub fn set_token(&mut self, token: String) -> Result<&mut Self, ZabbixError> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "user.checkAuthentication",
@@ -77,14 +148,14 @@ impl ZabbixInstance {
                 self.token = Some(token);
                 Ok(self)
             }
-            Err(e) => return Err(format!("Invalid token: {}", e)),
+            Err(e) => return Err(ZabbixError::Other(format!("Invalid token: {}", e))),
         }
     }
 
-    #[allow(dead_code)]
-    pub fn login(&mut self, username: String, password: String) -> Result<&mut Self, String> {
-        let v5_2 = Version::parse("5.2.0").map_err(|e| e.to_string())?;
-        let current_v = Version::parse(&self.version).map_err(|e| e.to_string())?;
+    /// Logs in to the Zabbix server with a username and password.
+    pub fn login(&mut self, username: String, password: String) -> Result<&mut Self, ZabbixError> {
+        let v5_2 = Version::parse("5.2.0")?;
+        let current_v = Version::parse(&self.version)?;
         let user_param = if current_v <= v5_2 {
             "user"
         } else {
@@ -116,7 +187,8 @@ impl ZabbixInstance {
         }
     }
 
-    pub fn logout(&mut self) -> Result<&mut Self, String> {
+    /// Logs out of the Zabbix server and invalidates the current token.
+    pub fn logout(&mut self) -> Result<&mut Self, ZabbixError> {
         if !self.need_logout {
             return Ok(self);
         }
@@ -144,8 +216,8 @@ impl ZabbixInstance {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn get_version(&self) -> Result<String, String> {
+    /// Retrieves the Zabbix server API version.
+    pub fn get_version(&self) -> Result<String, ZabbixError> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "apiinfo.version",
@@ -159,16 +231,17 @@ impl ZabbixInstance {
         Ok(version_str)
     }
 
-    #[allow(dead_code)]
-    pub fn check_version(&self, version_req: &str) -> Result<bool, String> {
-        let version_req = VersionReq::parse(version_req).map_err(|e| e.to_string())?;
-        let current_v = Version::parse(&self.version).map_err(|e| e.to_string())?;
+    /// Checks if the connected Zabbix server's version matches a semantic version requirement.
+    /// Example requirement: `>=6.4, <7.0`
+    pub fn check_version(&self, version_req: &str) -> Result<bool, ZabbixError> {
+        let version_req = VersionReq::parse(version_req)?;
+        let current_v = Version::parse(&self.version)?;
 
         Ok(version_req.matches(&current_v))
     }
 
-    #[allow(dead_code)]
-    pub fn zabbix_request(&self, method: &str, params: Value) -> Result<String, String> {
+    /// Makes a raw JSON-RPC request to the Zabbix API using a `serde_json::Value` parameter.
+    pub fn zabbix_request(&self, method: &str, params: Value) -> Result<String, ZabbixError> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -185,8 +258,8 @@ impl ZabbixInstance {
         )
     }
 
-    #[allow(dead_code)]
-    pub fn zabbix_request_string(&self, method: &str, params: &str) -> Result<String, String> {
+    /// Makes a raw JSON-RPC request to the Zabbix API using a JSON string parameter.
+    pub fn zabbix_request_string(&self, method: &str, params: &str) -> Result<String, ZabbixError> {
         let body = format!(
             r#"{{
                 "jsonrpc": "2.0",
@@ -199,7 +272,7 @@ impl ZabbixInstance {
             Uuid::new_v4().to_string()
         );
 
-        let payload = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        let payload = serde_json::from_str(&body)?;
 
         Self::zabbix_raw_request(
             &self.request_client,
@@ -216,7 +289,7 @@ impl ZabbixInstance {
         mut payload: Value,
         token: Option<&String>,
         need_auth_in_body: bool,
-    ) -> Result<String, String> {
+    ) -> Result<String, ZabbixError> {
         let mut request_builder = client
             .post(url)
             .header("Content-Type", "application/json-rpc");
@@ -232,18 +305,18 @@ impl ZabbixInstance {
             }
         }
 
-        let response = request_builder
-            .json(&payload)
-            .send()
-            .map_err(|e| e.to_string())?;
+        let response = request_builder.json(&payload).send()?;
 
         if !response.status().is_success() {
-            return Err(format!("HTTP Error: {}", response.status()));
+            return Err(ZabbixError::Other(format!(
+                "HTTP Error: {}",
+                response.status()
+            )));
         }
 
-        let text = response.text().map_err(|e| e.to_string())?;
+        let text = response.text()?;
 
-        let json: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let json: Value = serde_json::from_str(&text)?;
 
         if let Some(error) = json.get("error") {
             if error.is_object() {
@@ -252,9 +325,12 @@ impl ZabbixInstance {
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown error");
                 let data = error.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                return Err(format!("Zabbix API Error: {} {}", msg, data));
+                return Err(ZabbixError::ApiError {
+                    message: msg.to_string(),
+                    data: data.to_string(),
+                });
             }
-            return Err(error.to_string());
+            return Err(ZabbixError::Other(error.to_string()));
         }
 
         if let Some(result) = json.get("result") {
@@ -264,7 +340,7 @@ impl ZabbixInstance {
             return Ok(result.to_string());
         }
 
-        Err("Unknown response format".to_string())
+        Err(ZabbixError::Other("Unknown response format".to_string()))
     }
 }
 
