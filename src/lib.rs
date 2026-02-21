@@ -23,6 +23,32 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+/// An enum representing the types of parameters that can be passed to the Zabbix API.
+pub enum ApiRequestParams {
+    /// A raw pre-parsed JSON Value.
+    Json(Value),
+    /// A raw JSON string.
+    String(String),
+}
+
+impl From<Value> for ApiRequestParams {
+    fn from(v: Value) -> Self {
+        ApiRequestParams::Json(v)
+    }
+}
+
+impl From<&str> for ApiRequestParams {
+    fn from(s: &str) -> Self {
+        ApiRequestParams::String(s.to_string())
+    }
+}
+
+impl From<String> for ApiRequestParams {
+    fn from(s: String) -> Self {
+        ApiRequestParams::String(s)
+    }
+}
+
 /// Error type for Zabbix interactions.
 #[derive(Error, Debug)]
 pub enum ZabbixError {
@@ -42,7 +68,7 @@ pub enum ZabbixError {
 pub struct ZabbixInstance {
     id: String,
     url: String,
-    token: Option<String>,
+    token: String,
     request_client: Client,
     need_auth_in_body: bool,
     version: String,
@@ -60,6 +86,9 @@ impl ZabbixInstance {
 pub struct ZabbixInstanceBuilder {
     url: String,
     accept_invalid_certs: bool,
+    client: Option<Client>,
+    need_auth_in_body: bool,
+    version: String,
 }
 
 impl ZabbixInstanceBuilder {
@@ -68,6 +97,9 @@ impl ZabbixInstanceBuilder {
         Self {
             url: url.to_string(),
             accept_invalid_certs: false,
+            client: None,
+            need_auth_in_body: false,
+            version: "".to_string(),
         }
     }
 
@@ -81,7 +113,7 @@ impl ZabbixInstanceBuilder {
     }
 
     /// Builds the `ZabbixInstance` by connecting to the server and verifying the API version.
-    pub fn build(self) -> Result<ZabbixInstance, ZabbixError> {
+    pub fn build(mut self) -> Result<Self, ZabbixError> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "apiinfo.version",
@@ -96,38 +128,21 @@ impl ZabbixInstanceBuilder {
         let v6_4_req = VersionReq::parse(">=6.4")?;
 
         let version_str_raw =
-            ZabbixInstance::zabbix_raw_request(&client, &self.url, body, None, false)?;
+            ZabbixInstance::zabbix_raw_request(&client, &self.url, body, "", false)?;
         let version_str = version_str_raw.trim_matches('"');
 
         let current_v = Version::parse(version_str)?;
 
-        let need_auth_in_body = !(v6_4_req.matches(&current_v));
+        self.need_auth_in_body = !(v6_4_req.matches(&current_v));
 
-        Ok(ZabbixInstance {
-            id: Uuid::new_v4().to_string(),
-            need_auth_in_body,
-            token: None,
-            request_client: client,
-            url: self.url,
-            version: version_str.to_string(),
-            need_logout: false,
-        })
-    }
-}
+        self.client = Some(client);
 
-impl ZabbixInstance {
-    /// Returns the internally generated UUID for this instance.
-    pub fn id(&self) -> &str {
-        &self.id
+        self.version = version_str.to_string();
+
+        Ok(self)
     }
 
-    /// Returns the Zabbix API URL this instance connects to.
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-
-    /// Sets an existing authentication token and verifies it with the server.
-    pub fn set_token(&mut self, token: String) -> Result<&mut Self, ZabbixError> {
+    pub fn login_with_token(self, token: String) -> Result<ZabbixInstance, ZabbixError> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "user.checkAuthentication",
@@ -137,23 +152,42 @@ impl ZabbixInstance {
             "id": 1
         });
 
-        match Self::zabbix_raw_request(
-            &self.request_client,
+        let client = self.client.ok_or_else(|| {
+            ZabbixError::Other("Client not initialized. Did you call build()?".to_string())
+        })?;
+
+        match ZabbixInstance::zabbix_raw_request(
+            &client,
             &self.url,
             body,
-            None,
+            "",
             self.need_auth_in_body,
         ) {
             Ok(_) => {
-                self.token = Some(token);
-                Ok(self)
+                return Ok(ZabbixInstance {
+                    id: Uuid::new_v4().to_string(),
+                    need_auth_in_body: self.need_auth_in_body,
+                    token: token,
+                    request_client: client,
+                    url: self.url,
+                    version: self.version,
+                    need_logout: false,
+                });
             }
-            Err(e) => return Err(ZabbixError::Other(format!("Invalid token: {}", e))),
+            Err(e) => {
+                return Err(ZabbixError::ApiError {
+                    message: "Invalid token".to_string(),
+                    data: e.to_string(),
+                });
+            }
         }
     }
 
-    /// Logs in to the Zabbix server with a username and password.
-    pub fn login(&mut self, username: String, password: String) -> Result<&mut Self, ZabbixError> {
+    pub fn login_with_username_password(
+        self,
+        username: String,
+        password: String,
+    ) -> Result<ZabbixInstance, ZabbixError> {
         let v5_2 = Version::parse("5.2.0")?;
         let current_v = Version::parse(&self.version)?;
         let user_param = if current_v <= v5_2 {
@@ -171,20 +205,39 @@ impl ZabbixInstance {
             "id": 1
         });
 
-        match Self::zabbix_raw_request(
-            &self.request_client,
+        let client = self.client.ok_or_else(|| {
+            ZabbixError::Other("Client not initialized. Did you call build()?".to_string())
+        })?;
+
+        let token = ZabbixInstance::zabbix_raw_request(
+            &client,
             &self.url,
             body,
-            None,
+            "",
             self.need_auth_in_body,
-        ) {
-            Ok(token) => {
-                self.token = Some(token.trim_matches('"').to_string());
-                self.need_logout = true;
-                Ok(self)
-            }
-            Err(e) => Err(e),
-        }
+        )?;
+
+        Ok(ZabbixInstance {
+            id: Uuid::new_v4().to_string(),
+            need_auth_in_body: self.need_auth_in_body,
+            token: token,
+            request_client: client,
+            url: self.url,
+            version: self.version,
+            need_logout: true,
+        })
+    }
+}
+
+impl ZabbixInstance {
+    /// Returns the internally generated UUID for this instance.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the Zabbix API URL this instance connects to.
+    pub fn url(&self) -> &str {
+        &self.url
     }
 
     /// Logs out of the Zabbix server and invalidates the current token.
@@ -208,7 +261,7 @@ impl ZabbixInstance {
             self.need_auth_in_body,
         ) {
             Ok(_) => {
-                self.token = None;
+                self.token = "".to_string();
                 self.need_logout = false;
                 Ok(self)
             }
@@ -226,7 +279,7 @@ impl ZabbixInstance {
         });
 
         let version_str =
-            Self::zabbix_raw_request(&self.request_client, &self.url, body, None, false)?;
+            Self::zabbix_raw_request(&self.request_client, &self.url, body, "", false)?;
 
         Ok(version_str)
     }
@@ -240,12 +293,23 @@ impl ZabbixInstance {
         Ok(version_req.matches(&current_v))
     }
 
-    /// Makes a raw JSON-RPC request to the Zabbix API using a `serde_json::Value` parameter.
-    pub fn zabbix_request(&self, method: &str, params: Value) -> Result<String, ZabbixError> {
+    /// Makes a raw JSON-RPC request to the Zabbix API.
+    ///
+    /// `params` can be either a `serde_json::Value` (like `json!({...})`), a string slice `&str`, or a `String`.
+    pub fn zabbix_request<P: Into<ApiRequestParams>>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> Result<String, ZabbixError> {
+        let params_val = match params.into() {
+            ApiRequestParams::Json(val) => val,
+            ApiRequestParams::String(s) => serde_json::from_str(&s).map_err(ZabbixError::from)?,
+        };
+
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
-            "params": params,
+            "params": params_val,
             "id": Uuid::new_v4().to_string()
         });
 
@@ -253,32 +317,7 @@ impl ZabbixInstance {
             &self.request_client,
             &self.url,
             body,
-            self.token.as_ref(),
-            self.need_auth_in_body,
-        )
-    }
-
-    /// Makes a raw JSON-RPC request to the Zabbix API using a JSON string parameter.
-    pub fn zabbix_request_string(&self, method: &str, params: &str) -> Result<String, ZabbixError> {
-        let body = format!(
-            r#"{{
-                "jsonrpc": "2.0",
-                "method": "{}",
-                "params": {},
-                "id": "{}"
-            }}"#,
-            method,
-            params,
-            Uuid::new_v4().to_string()
-        );
-
-        let payload = serde_json::from_str(&body)?;
-
-        Self::zabbix_raw_request(
-            &self.request_client,
-            &self.url,
-            payload,
-            self.token.as_ref(),
+            &self.token,
             self.need_auth_in_body,
         )
     }
@@ -287,20 +326,20 @@ impl ZabbixInstance {
         client: &Client,
         url: &str,
         mut payload: Value,
-        token: Option<&String>,
+        token: &str,
         need_auth_in_body: bool,
     ) -> Result<String, ZabbixError> {
         let mut request_builder = client
             .post(url)
             .header("Content-Type", "application/json-rpc");
 
-        if let Some(tok) = token {
+        if token != "" {
             if !need_auth_in_body {
                 request_builder =
-                    request_builder.header("Authorization", format!("Bearer {}", tok));
+                    request_builder.header("Authorization", format!("Bearer {}", token));
             } else {
                 if let Some(obj) = payload.as_object_mut() {
-                    obj.insert("auth".to_string(), Value::String(tok.to_string()));
+                    obj.insert("auth".to_string(), Value::String(String::from(token)));
                 }
             }
         }
