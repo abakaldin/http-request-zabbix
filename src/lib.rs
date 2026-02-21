@@ -8,12 +8,13 @@
 //! ```no_run
 //! use http_request_zabbix::ZabbixInstance;
 //!
-//! let mut zabbix = ZabbixInstance::builder("http://zabbix.example.com/zabbix/api_jsonrpc.php")
+//! let zabbix = ZabbixInstance::builder("http://zabbix.example.com/zabbix/api_jsonrpc.php")
 //!     .danger_accept_invalid_certs(true)
 //!     .build()
+//!     .unwrap()
+//!     .login_with_username_password("Admin".to_string(), "zabbix".to_string())
 //!     .unwrap();
 //!
-//! zabbix.login("Admin".to_string(), "zabbix".to_string()).unwrap();
 //! println!("Zabbix Version: {}", zabbix.get_version().unwrap());
 //! ```
 
@@ -76,7 +77,15 @@ pub struct ZabbixInstance {
 }
 
 impl ZabbixInstance {
-    /// Returns a builder to configure and create a `ZabbixInstance`.
+    /// Creates a new `ZabbixInstanceBuilder` to configure the connection.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http_request_zabbix::ZabbixInstance;
+    ///
+    /// let builder = ZabbixInstance::builder("http://localhost/zabbix/api_jsonrpc.php");
+    /// ```
     pub fn builder(url: &str) -> ZabbixInstanceBuilder {
         ZabbixInstanceBuilder::new(url)
     }
@@ -113,6 +122,30 @@ impl ZabbixInstanceBuilder {
     }
 
     /// Builds the `ZabbixInstance` by connecting to the server and verifying the API version.
+    ///
+    /// This method will make an initial unauthenticated request to the Zabbix server
+    /// to determine its version (using `apiinfo.version`). This is required because
+    /// Zabbix >= 6.4 changed the authentication flow (using Bearer tokens instead of
+    /// passing auth in the request body).
+    ///
+    /// # Errors
+    ///
+    /// This method will return a `ZabbixError` if:
+    /// * The provided URL is invalid or unreachable (`ZabbixError::Network`).
+    /// * The server responds with invalid JSON (`ZabbixError::Json`).
+    /// * The server returns a version string that cannot be parsed by semantic versioning rules (`ZabbixError::VersionParse`).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use http_request_zabbix::ZabbixInstance;
+    ///
+    /// let zabbix_result = ZabbixInstance::builder("http://zabbix.example.com/api_jsonrpc.php")
+    ///     .danger_accept_invalid_certs(true)
+    ///     .build();
+    ///     
+    /// assert!(zabbix_result.is_ok());
+    /// ```
     pub fn build(mut self) -> Result<Self, ZabbixError> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -183,6 +216,27 @@ impl ZabbixInstanceBuilder {
         }
     }
 
+    /// Logs in to the Zabbix server with a username and password.
+    ///
+    /// This method consumes the `ZabbixInstanceBuilder` (which has no authentication)
+    /// and returns a fully authenticated `ZabbixInstance` ready to make API requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ZabbixError` if:
+    /// * The username or password is incorrect (`ZabbixError::ApiError`).
+    /// * The server cannot be reached (`ZabbixError::Network`).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use http_request_zabbix::ZabbixInstance;
+    ///
+    /// let builder = ZabbixInstance::builder("http://zabbix.example.com/api_jsonrpc.php").build().unwrap();
+    ///
+    /// // The builder is consumed here, returning the logged-in instance
+    /// let zabbix = builder.login_with_username_password("Admin".to_string(), "zabbix".to_string()).unwrap();
+    /// ```
     pub fn login_with_username_password(
         self,
         username: String,
@@ -388,5 +442,36 @@ impl Drop for ZabbixInstance {
         if self.need_logout {
             self.logout().ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockito::Server;
+
+    #[test]
+    fn test_login_with_token_success() {
+        let mut server = Server::new();
+        let url = server.url();
+
+        let mock_version = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","result":"7.0.0","id":1}"#)
+            .create();
+
+        let mock_auth = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","result":"dummy_token","id":1}"#)
+            .create();
+
+        let builder = ZabbixInstanceBuilder::new(&url).build().unwrap();
+        let result = builder.login_with_token("test_token".to_string());
+
+        assert!(result.is_ok());
+        mock_version.assert();
+        mock_auth.assert();
     }
 }
