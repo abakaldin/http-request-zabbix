@@ -201,21 +201,20 @@ impl ZabbixInstanceBuilder {
     /// assert!(zabbix_result.is_ok());
     /// ```
     pub fn build(mut self) -> Result<Self, ZabbixError> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "apiinfo.version",
-            "params": [],
-            "id": 1
-        });
-
         let client = Client::builder()
             .danger_accept_invalid_certs(self.accept_invalid_certs)
             .build()?;
 
         let v6_4_req = VersionReq::parse(">=6.4")?;
 
-        let version_str_raw =
-            ZabbixInstance::zabbix_raw_request(&client, &self.url, body, "", false)?;
+        let version_str_raw = ZabbixInstance::zabbix_raw_request(
+            &client,
+            &self.url,
+            "apiinfo.version",
+            serde_json::json!([]),
+            "",
+            false,
+        )?;
         let version_str = version_str_raw.trim_matches('"');
 
         let current_v = Version::parse(version_str)?;
@@ -270,15 +269,6 @@ impl ZabbixInstanceBuilder {
     }
 
     fn login_with_token(self, token: String) -> Result<ZabbixInstance, ZabbixError> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "user.checkAuthentication",
-            "params": {
-                "token": token
-            },
-            "id": 1
-        });
-
         let client = self.client.ok_or_else(|| {
             ZabbixError::Other("Client not initialized. Did you call build()?".to_string())
         })?;
@@ -286,7 +276,8 @@ impl ZabbixInstanceBuilder {
         match ZabbixInstance::zabbix_raw_request(
             &client,
             &self.url,
-            body,
+            "user.checkAuthentication",
+            serde_json::json!({"token": token}),
             "",
             self.need_auth_in_body,
         ) {
@@ -322,15 +313,6 @@ impl ZabbixInstanceBuilder {
         } else {
             "username"
         };
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "user.login",
-            "params": {
-                user_param: username,
-                "password": password
-            },
-            "id": 1
-        });
 
         let client = self.client.ok_or_else(|| {
             ZabbixError::Other("Client not initialized. Did you call build()?".to_string())
@@ -339,7 +321,8 @@ impl ZabbixInstanceBuilder {
         let token = ZabbixInstance::zabbix_raw_request(
             &client,
             &self.url,
-            body,
+            "user.login",
+            serde_json::json!({user_param: username, "password": password}),
             "",
             self.need_auth_in_body,
         )?;
@@ -416,17 +399,11 @@ impl ZabbixInstance {
             return Ok(self);
         }
 
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "user.logout",
-            "params": [],
-            "id": 1
-        });
-
         match Self::zabbix_raw_request(
             &self.request_client,
             &self.url,
-            body,
+            "user.logout",
+            serde_json::json!([]),
             self.token.as_ref(),
             self.need_auth_in_body,
         ) {
@@ -457,15 +434,14 @@ impl ZabbixInstance {
     /// println!("Zabbix Version: {}", zabbix.get_version().unwrap());
     /// ```
     pub fn get_version(&self) -> Result<String, ZabbixError> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "apiinfo.version",
-            "params": [],
-            "id": 1
-        });
-
-        let version_str =
-            Self::zabbix_raw_request(&self.request_client, &self.url, body, "", false)?;
+        let version_str = Self::zabbix_raw_request(
+            &self.request_client,
+            &self.url,
+            "apiinfo.version",
+            serde_json::json!([]),
+            "",
+            false,
+        )?;
 
         Ok(version_str)
     }
@@ -522,17 +498,11 @@ impl ZabbixInstance {
             ApiRequestParams::String(s) => serde_json::from_str(&s).map_err(ZabbixError::from)?,
         };
 
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params_val,
-            "id": Uuid::new_v4().to_string()
-        });
-
         Self::zabbix_raw_request(
             &self.request_client,
             &self.url,
-            body,
+            method,
+            params_val,
             &self.token,
             self.need_auth_in_body,
         )
@@ -541,13 +511,21 @@ impl ZabbixInstance {
     fn zabbix_raw_request(
         client: &Client,
         url: &str,
-        mut payload: Value,
+        method: &str,
+        params: Value,
         token: &str,
         need_auth_in_body: bool,
     ) -> Result<String, ZabbixError> {
         let mut request_builder = client
             .post(format!("{}/api_jsonrpc.php", url))
             .header("Content-Type", "application/json-rpc");
+
+        let mut payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": Uuid::new_v4().to_string()
+        });
 
         if token != "" {
             if !need_auth_in_body {
